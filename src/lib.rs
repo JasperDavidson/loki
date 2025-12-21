@@ -1,4 +1,5 @@
 mod allocator;
+mod translator;
 
 #[cfg(test)]
 mod tests {
