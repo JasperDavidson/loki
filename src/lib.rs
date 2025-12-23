@@ -1,5 +1,6 @@
 mod allocator;
-mod translator;
+mod scheduler;
+mod table;
 
 #[cfg(test)]
 mod tests {

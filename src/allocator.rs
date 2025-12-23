@@ -13,8 +13,8 @@ pub struct LayerBlockHandle(pub u64);
 
 pub struct Allocator {
     total_mem: u64,
-    layer_free: Vec<u64>, // these free lists map to the physical addresses
-    cache_free: Vec<u64>,
+    layer_free_mem: Vec<u64>, // these free lists map to the physical addresses
+    cache_free_mem: Vec<u64>,
     layer_mem_total: u64,
     virtual_counter: u64,
 }
@@ -33,8 +33,8 @@ impl Allocator {
 
         Self {
             total_mem,
-            layer_free: vec![0], // Assume 1 active model initially
-            cache_free,
+            layer_free_mem: vec![0], // Assume 1 active model initially
+            cache_free_mem: cache_free,
             layer_mem_total: total_mem - cache_mem_size,
             virtual_counter: 0,
         }
@@ -56,21 +56,21 @@ impl Allocator {
     // Need to handle when there aren't physical blocks available
     // Scheduler can call this when running
     pub fn try_cache_alloc_phys(&mut self) -> Option<u64> {
-        self.cache_free.pop()
+        self.cache_free_mem.pop()
     }
 
     pub fn try_layer_alloc_phys(&mut self) -> Option<u64> {
-        self.layer_free.pop()
+        self.layer_free_mem.pop()
     }
 
     pub fn free_cache(&mut self, phys_id: u64) {
-        self.cache_free.push(phys_id);
+        self.cache_free_mem.push(phys_id);
     }
 
     // Scheduler and translator will handle the other active models have increased layer streaming
     // capacity
     pub fn free_layer(&mut self, phys_id: u64) {
-        self.layer_free.push(phys_id);
+        self.layer_free_mem.push(phys_id);
     }
 
     // The goal here is to re-partition layer memory such that each model has fair access to layer
@@ -85,12 +85,12 @@ impl Allocator {
     // Look into relocation strategy in the future to avoid as much memory latency
     pub fn change_active_models(&mut self, num_active: u8) -> u64 {
         let new_slot_size = self.layer_mem_total / num_active as u64;
-        self.layer_free.clear();
+        self.layer_free_mem.clear();
 
         for id in
             (0..self.layer_mem_total).step_by((self.layer_mem_total / num_active as u64) as usize)
         {
-            self.layer_free.push(id as u64);
+            self.layer_free_mem.push(id as u64);
         }
 
         new_slot_size
