@@ -1,7 +1,9 @@
 use priority_queue::DoublePriorityQueue;
 use std::collections::{BTreeMap, HashMap, HashSet};
+use thiserror::Error;
 
-use crate::allocator::{CacheBlockHandle, LayerBlockHandle};
+use crate::allocator::{Allocator, CacheBlockHandle, LayerBlockHandle};
+use crate::table::{Table, TableError};
 
 #[derive(PartialEq, Eq, Hash, Clone, Copy)]
 struct ModelID(u8);
@@ -70,15 +72,25 @@ struct Scheduler {
     cache_weight_ratio: f32,
 
     registry: Registry,
+    allocator: Allocator,
+    table: Table,
+
     iter_req_models: HashSet<ModelID>,
     request_priority_queue: DoublePriorityQueue<RequestID, RequestMetadata>,
     active_requests: Vec<RequestID>,
     active_size_map: BTreeMap<RequestMetadata, u64>,
 }
 
+#[derive(Error, Debug)]
 enum SchedulerError {
+    #[error("Model ID not mapped to a valid model")]
     UnmappedModel,
+
+    #[error("Request ID not a valid key")]
     FailedRequestID,
+
+    #[error("Table failure: {0}")]
+    TableError(#[from] TableError),
 }
 
 impl Scheduler {
@@ -173,7 +185,8 @@ impl Scheduler {
                     let lowest_priority = self
                         .request_priority_queue
                         .pop_min()
-                        .ok_or(SchedulerError::FailedRequestID)?;
+                        .ok_or(SchedulerError::FailedRequestID)?; // TODO: This shouldn't be an
+                    // error
 
                     let mut possible_size = 0;
                     for size in self.active_size_map.iter() {
@@ -214,8 +227,8 @@ impl Scheduler {
                 .priority_request_map
                 .get(&new_data.id)
                 .ok_or(SchedulerError::FailedRequestID)?;
+
             // Need to add more errors for this sequence and/or it can likely be cleaned up?
-            // This shouldn't be in unfulfilled request lmao...
             let req_model = self
                 .registry
                 .req_to_model
