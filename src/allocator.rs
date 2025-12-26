@@ -1,3 +1,6 @@
+#[derive(Clone, Copy)]
+pub struct PhysicalId(pub u64);
+
 // Make it such that last used is updated to the newest value when accessed for the first time
 // (last_used = 0) via the memory translator
 // Note the memory translator will store cache bock size to avoid repeating the value across many
@@ -13,8 +16,8 @@ pub struct LayerBlockHandle(pub u64);
 
 pub struct Allocator {
     total_mem: u64,
-    layer_free_mem: Vec<u64>, // these free lists map to the physical addresses
-    cache_free_mem: Vec<u64>,
+    layer_free_mem: Vec<PhysicalId>, // these free lists map to the physical addresses
+    cache_free_mem: Vec<PhysicalId>,
     layer_mem_total: u64,
     virtual_counter: u64,
 }
@@ -28,12 +31,12 @@ impl Allocator {
         let num_cache_blocks = cache_mem_size / (cache_block_size as u64);
         let mut cache_free = Vec::with_capacity(num_cache_blocks as usize);
         for id in ((total_mem - cache_mem_size)..total_mem).step_by(cache_block_size as usize) {
-            cache_free.push(id as u64);
+            cache_free.push(PhysicalId(id));
         }
 
         Self {
             total_mem,
-            layer_free_mem: vec![0], // Assume 1 active model initially
+            layer_free_mem: vec![PhysicalId(0)], // Assume 1 active model initially
             cache_free_mem: cache_free,
             layer_mem_total: total_mem - cache_mem_size,
             virtual_counter: 0,
@@ -55,21 +58,21 @@ impl Allocator {
 
     // Need to handle when there aren't physical blocks available
     // Scheduler can call this when running
-    pub fn try_cache_alloc_phys(&mut self) -> Option<u64> {
+    pub fn try_cache_alloc_phys(&mut self) -> Option<PhysicalId> {
         self.cache_free_mem.pop()
     }
 
-    pub fn try_layer_alloc_phys(&mut self) -> Option<u64> {
+    pub fn try_layer_alloc_phys(&mut self) -> Option<PhysicalId> {
         self.layer_free_mem.pop()
     }
 
-    pub fn free_cache(&mut self, phys_id: u64) {
+    pub fn free_cache(&mut self, phys_id: PhysicalId) {
         self.cache_free_mem.push(phys_id);
     }
 
     // Scheduler and translator will handle the other active models have increased layer streaming
     // capacity
-    pub fn free_layer(&mut self, phys_id: u64) {
+    pub fn free_layer(&mut self, phys_id: PhysicalId) {
         self.layer_free_mem.push(phys_id);
     }
 
@@ -90,7 +93,7 @@ impl Allocator {
         for id in
             (0..self.layer_mem_total).step_by((self.layer_mem_total / num_active as u64) as usize)
         {
-            self.layer_free_mem.push(id as u64);
+            self.layer_free_mem.push(PhysicalId(id));
         }
 
         new_slot_size
