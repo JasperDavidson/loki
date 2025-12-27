@@ -41,6 +41,11 @@ impl PartialOrd for RequestMetadata {
     }
 }
 
+// TODO: Figure out how to represent this
+struct IncomingRequest {
+    tier: u8,
+}
+
 impl RequestMetadata {
     pub fn check_priority_boost(&mut self) {
         if self.age > 100 {
@@ -65,17 +70,23 @@ struct Registry {
     priority_request_map: HashMap<RequestID, Request>,
 }
 
-struct Scheduler {
+struct SystemInfo {
     total_mem: u64,
     cache_free_mem: u64,
     layer_free_mem: u64,
     cache_weight_ratio: f32,
+}
+
+struct Scheduler {
+    info: SystemInfo,
+    request_complete: bool,
 
     registry: Registry,
     allocator: Allocator,
     table: Table,
 
     iter_req_models: HashSet<ModelID>,
+    request_counter: u32,
     request_priority_queue: DoublePriorityQueue<RequestID, RequestMetadata>,
     active_requests: Vec<RequestID>,
     active_size_map: BTreeMap<RequestMetadata, u64>,
@@ -85,30 +96,46 @@ struct Scheduler {
 enum SchedulerError {
     #[error("Model ID not mapped to a valid model")]
     UnmappedModel,
-
     #[error("Request ID not a valid key")]
     FailedRequestID,
-
     #[error("Table failure: {0}")]
     TableError(#[from] TableError),
 }
 
 impl Scheduler {
+    // TODO: Figure out external API to receive requests
+    pub fn enqueue_request(
+        &mut self,
+        incoming_request: IncomingRequest,
+    ) -> Result<(), SchedulerError> {
+        let req_id = RequestID(self.request_counter);
+        self.request_priority_queue.push(
+            req_id,
+            RequestMetadata {
+                id: req_id,
+                tier: incoming_request.tier,
+                age: 0,
+            },
+        );
+        self.request_counter += 1;
+
+        Ok(())
+    }
+
     // This function gets ran after every decoding cycle (every model has produced one token)
     pub fn step(&mut self) -> Result<(), SchedulerError> {
         self.evict_finished_requests()?;
 
         let (new_requests, unfulfilled_requests) = self.schedule_pending_requests()?;
 
-        // Allocate physical memory addresses for each request layer block/cache block -> should
-        // the scheduler own an allocator? Or maybe they could communicate via channels?
-        // Then compute prefill for new requests (need to look into this)
+        // Allocate physical memory addresses for each request layer block/cache block
+        // Then compute prefill for new requests (need to look into this) -> only llm?
         // Maybe should maintain a state vector of all the requests currently being under prefill
         // which get moved into the active stage afterwards?
         self.allocate_resources(new_requests)?;
 
         // Perform iteration level scheduling on all active requests
-        // 1. Check if the request needs more KV cache blocks to continue token generation
+        // Check if the request needs more KV cache blocks to continue token generation
         self.step_active_requests()?;
 
         // Handle the unfulfilled data, pushing it back into the priority queue
@@ -120,10 +147,14 @@ impl Scheduler {
 
     fn evict_finished_requests(&mut self) -> Result<(), SchedulerError> {
         // Check if any requests have finished, if so evict them
-        // Maybe update a flag in each request and iterate through
-        // - I think it would it would be better if we set a flag when receiving a request from the
-        // GPU
-        for request in self.active_requests.iter() {}
+        // TODO: I think it would it would be better if we set a flag when receiving a request from the
+        // GPU that triggered us to perform the iteration to avoid useless checking
+        if self.request_complete {
+            for request in self.active_requests.iter() {
+                // TODO: Fetch request result and evict
+            }
+        }
+
         Ok(())
     }
 
@@ -162,9 +193,9 @@ impl Scheduler {
             // weights
             let can_allocate_model = match self.iter_req_models.get(&request_model.id) {
                 Some(_) => true,
-                None => (request_model.layer_size as u64 * 2) < self.layer_free_mem,
+                None => (request_model.layer_size as u64 * 2) < self.info.layer_free_mem,
             };
-            let can_allocate_cache = (cache_needed as u64) < self.cache_free_mem;
+            let can_allocate_cache = (cache_needed as u64) < self.info.cache_free_mem;
             if can_allocate_cache && can_allocate_model {
                 new_requests.push(metadata);
             } else if can_allocate_model {
