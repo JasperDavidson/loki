@@ -5,20 +5,35 @@ use crate::allocator::{Allocator, CacheBlockHandle, LayerBlockHandle, PhysicalId
 
 trait Evictable {
     fn is_pinned(&self) -> bool;
+    fn is_used(&self) -> bool;
+    fn set_used(&mut self, used: bool);
+    fn set_in_clock(&mut self, clock: bool);
 }
 
 trait Swappable {
     fn get_phys_id(&self) -> Option<PhysicalId>;
 }
 
+#[derive(Default)]
 pub struct CacheBlock {
     pub phys_id: Option<PhysicalId>, // none if swapped to disk
     pinned: bool,                    // true if a model is actively using this block for calculation
+    used: bool,                      // true if active in LRU
+    in_clock: bool,
 }
 
 impl Evictable for CacheBlock {
     fn is_pinned(&self) -> bool {
         self.pinned
+    }
+    fn is_used(&self) -> bool {
+        self.used
+    }
+    fn set_used(&mut self, used: bool) {
+        self.used = used;
+    }
+    fn set_in_clock(&mut self, clock: bool) {
+        self.in_clock = clock;
     }
 }
 
@@ -29,17 +44,29 @@ impl Swappable for CacheBlock {
 }
 
 // The layer size combined will allow the virtual ID mapping to offset to the correct slot
+#[derive(Default)]
 pub struct LayerBlock {
     pub phys_id: Option<PhysicalId>,
-    layer_size: u32,
+    // layer_size: u32,
     num_layers: u16,
     cur_layer: u16,
     pinned: bool,
+    used: bool,
+    in_clock: bool,
 }
 
 impl Evictable for LayerBlock {
     fn is_pinned(&self) -> bool {
         self.pinned
+    }
+    fn is_used(&self) -> bool {
+        self.used
+    }
+    fn set_used(&mut self, used: bool) {
+        self.used = used;
+    }
+    fn set_in_clock(&mut self, clock: bool) {
+        self.in_clock = clock;
     }
 }
 
@@ -84,37 +111,33 @@ where
 // invalidated
 fn clock_sweep<K, V>(
     block_table: &mut HashMap<K, V>,
-    clock_lru: &mut VecDeque<(K, bool)>,
+    clock_lru: &mut VecDeque<K>,
 ) -> Result<K, TableError>
 where
     K: Eq + std::hash::Hash + Copy + Clone,
     V: Evictable,
 {
-    // Perform the clock sweep
-    // Match on the pinned
+    // max checks is two times the length since it will have cycled through all possibilities
     let max_checks = clock_lru.len() * 2;
     let mut checks = 0;
 
     let mut evict_block_handle = None;
     while checks < max_checks {
         // match on pinned/adjust usage of block fetched from lru queue
-        // Maybe look into this error later
-        let (lru_block_handle, lru_used) = clock_lru.pop_back().ok_or(TableError::InvalidSwap)?;
+        let lru_block_handle = clock_lru.pop_back().ok_or(TableError::InvalidSwap)?;
         let lru_block = block_table
-            .get(&lru_block_handle)
+            .get_mut(&lru_block_handle)
             .ok_or(TableError::InvalidCacheHandle)?;
-        match (lru_block.is_pinned(), lru_used) {
-            (true, _) => {
-                clock_lru.push_front((lru_block_handle, true));
-            }
-            (false, true) => {
-                clock_lru.push_front((lru_block_handle, false));
-            }
-            (false, false) => {
-                // Should this stay popped off? I think not since it's newly used
-                evict_block_handle = Some(lru_block_handle);
-                clock_lru.push_front((lru_block_handle, true));
-            }
+
+        if lru_block.is_pinned() {
+            clock_lru.push_front(lru_block_handle);
+        } else if lru_block.is_used() {
+            lru_block.set_used(false);
+            clock_lru.push_front(lru_block_handle);
+        } else {
+            evict_block_handle = Some(lru_block_handle);
+            lru_block.set_in_clock(false);
+            clock_lru.push_front(lru_block_handle);
         }
 
         checks += 1;
@@ -133,8 +156,8 @@ where
 pub struct Table {
     pub cache_table: HashMap<CacheBlockHandle, CacheBlock>,
     pub layer_table: HashMap<LayerBlockHandle, LayerBlock>,
-    cache_clock_lru: VecDeque<(CacheBlockHandle, bool)>, // true if used since last swept by clock
-    layer_clock_lru: VecDeque<(LayerBlockHandle, bool)>,
+    cache_clock_lru: VecDeque<CacheBlockHandle>, // true if used since last swept by clock
+    layer_clock_lru: VecDeque<LayerBlockHandle>,
     // Note that either LRU being empty is a logic error (if asked to swap by the scheduler)
 }
 
@@ -153,14 +176,20 @@ pub enum TableError {
 }
 
 impl Table {
+    // do we need a constructor?
+    // most of the fields should be defaultable
+    //    pub fn new() -> Self {
+    //        Table {}
+    //    }
+
     // Registers a models layer block in the map
-    pub fn register_layer_block(&mut self, layer_handle: LayerBlockHandle, layer_size: u32) {
+    pub fn register_layer_block(&mut self, layer_handle: LayerBlockHandle) {
         let layer_block = LayerBlock {
             phys_id: None,
-            layer_size,
+            // layer_size,
             num_layers: 0,
             cur_layer: 0,
-            pinned: false,
+            ..Default::default()
         };
         self.layer_table.insert(layer_handle, layer_block);
     }
@@ -169,17 +198,16 @@ impl Table {
         let cache_block = CacheBlock {
             phys_id: None,
             pinned: false,
+            ..Default::default()
         };
         self.cache_table.insert(cache_handle, cache_block);
     }
 
-    // Activates an existing layer block for a model with a new number of layers based on shifting
-    // model count
+    // Activates an existing layer block for a model
     pub fn activate_layer_block(
         &mut self,
         allocator: &mut Allocator,
         layer_handle: LayerBlockHandle,
-        num_layers: u16,
     ) -> Result<(), TableError> {
         // Check if the layer needs to be swapped to VRAM
         let needs_alloc = self
@@ -217,6 +245,12 @@ impl Table {
             layer_block.phys_id = Some(phys_id);
         }
         layer_block.pinned = true;
+        layer_block.used = true;
+
+        if !layer_block.in_clock {
+            self.layer_clock_lru.push_front(layer_handle);
+            layer_block.in_clock = true;
+        }
 
         Ok(())
     }
@@ -229,12 +263,12 @@ impl Table {
         let needs_alloc = self
             .cache_table
             .get(&cache_handle)
-            .map(|b| b.phys_id.is_some())
+            .map(|b| b.phys_id.is_none())
             .ok_or(TableError::InvalidCacheHandle)?;
 
         let mut new_phys_id = None;
         if needs_alloc {
-            new_phys_id = Some(match allocator.try_layer_alloc_phys() {
+            new_phys_id = Some(match allocator.try_cache_alloc_phys() {
                 Some(id) => id,
                 None => {
                     // Find a handle to swap with and execute
@@ -256,21 +290,31 @@ impl Table {
             .get_mut(&cache_handle)
             .ok_or(TableError::InvalidCacheHandle)?;
 
-        // Update block and push to LRU
+        // update block and mark it as activated
         if let Some(new_phys_id) = new_phys_id {
             cache_block.phys_id = Some(new_phys_id);
         }
-        cache_block.pinned = true;
 
-        self.cache_clock_lru.push_back((cache_handle, true));
+        cache_block.pinned = true;
+        cache_block.used = true;
+
+        // Add to the clock queue if not already there
+        if !cache_block.in_clock {
+            self.cache_clock_lru.push_front(cache_handle);
+            cache_block.in_clock = true;
+        }
+
         Ok(())
     }
 
-    pub fn activate_cache_blocks(
+    pub fn activate_cache_blocks<I>(
         &mut self,
         allocator: &mut Allocator,
-        cache_handles: Vec<CacheBlockHandle>,
-    ) -> Result<(), TableError> {
+        cache_handles: I,
+    ) -> Result<(), TableError>
+    where
+        I: IntoIterator<Item = CacheBlockHandle>,
+    {
         for cache_handle in cache_handles {
             self.activate_cache_block(allocator, cache_handle)?;
         }

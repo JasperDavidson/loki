@@ -6,7 +6,12 @@ use crate::allocator::{Allocator, CacheBlockHandle, LayerBlockHandle};
 use crate::table::{Table, TableError};
 
 #[derive(PartialEq, Eq, Hash, Clone, Copy)]
-struct ModelID(u8);
+pub struct ModelID(pub u8);
+
+// array of model metadata passed on runtime creation
+struct ModelMetadata {
+    layer_size: u64,
+}
 
 struct Model {
     id: ModelID,
