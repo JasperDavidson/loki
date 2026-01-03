@@ -9,8 +9,14 @@ use crate::table::{Table, TableError};
 pub struct ModelID(pub u8);
 
 // array of model metadata passed on runtime creation
-struct ModelMetadata {
-    layer_size: u64,
+// assuming batch size of 1 currently
+pub struct ModelMetadata {
+    pub layer_size: u64,
+    pub hidden_size: u64,
+    pub vocab_size: u64,
+    pub max_sequence_len: u64,
+    pub info_size: u8, // e.g. f32 is 4 bytes
+    pub mlp_expansion_factor: u8,
 }
 
 struct Model {
@@ -18,7 +24,6 @@ struct Model {
     layer_size: u32,
     layer_count: u32,
     layer_block: LayerBlockHandle,
-    cache_block_size: u32,
 }
 
 #[derive(PartialEq, Eq, Hash, Clone, Copy)]
@@ -64,6 +69,7 @@ impl RequestMetadata {
 struct Request {
     priority: RequestMetadata,
     model_id: ModelID,
+    cur_layer: u32,
     cache_ids: Vec<CacheBlockHandle>, // Use formula when loading request comp with Model to
                                       // calculate initial # blocks needed, then grow later as needed (i.e. this should be determined by the prefill phase -> only LLMs have prefill though...)
 }
@@ -77,9 +83,8 @@ struct Registry {
 
 struct SystemInfo {
     total_mem: u64,
-    cache_free_mem: u64,
-    layer_free_mem: u64,
-    cache_weight_ratio: f32,
+    cache_block_size: u32,
+    model_layer_sizes: Vec<(ModelID, u64)>,
 }
 
 struct Scheduler {
@@ -108,6 +113,14 @@ enum SchedulerError {
 }
 
 impl Scheduler {
+    //    pub fn new(sys_info: SystemInfo) -> Self {
+    //        let allocator = Allocator::new(
+    //            sys_info.total_mem,
+    //            sys_info.cache_block_size,
+    //            &sys_info.model_layer_sizes.as_slice(),
+    //        );
+    //    }
+
     // TODO: Figure out external API to receive requests
     pub fn enqueue_request(
         &mut self,
@@ -155,12 +168,46 @@ impl Scheduler {
         // TODO: I think it would it would be better if we set a flag when receiving a request from the
         // GPU that triggered us to perform the iteration to avoid useless checking
         if self.request_complete {
+            let mut complete_requests = Vec::new();
             for request in self.active_requests.iter() {
                 // TODO: Fetch request result and evict
+                // check if the request is complete or not
             }
+
+            self.evict_requests(complete_requests);
         }
 
         Ok(())
+    }
+
+    // given request ids, cleanly swap them out from gpu memory
+    fn evict_requests(&mut self, request_ids: Vec<RequestID>) -> Result<(), SchedulerError> {}
+
+    // Goal: search for evictable cache blocks of lower priority than the requested
+    // task, otherwise shelve and attempt again on the next step
+    // possibe optimization in the future: find the *best* blocks to remove, in the sense that
+    // the *best* blocks should sum to some overall minimum priority
+    fn find_evictable_cache(
+        &self,
+        metadata: &RequestMetadata,
+        cache_needed: u64,
+    ) -> Option<Vec<RequestMetadata>> {
+        let mut possible_size = 0;
+        let mut possible_metadata = Vec::new();
+        for size in self.active_size_map.iter().rev() {
+            if *size.0 > *metadata || possible_size >= cache_needed {
+                break;
+            } else {
+                possible_size += *size.1;
+                possible_metadata.push(*size.0);
+            }
+        }
+
+        if possible_size >= cache_needed {
+            Some(possible_metadata)
+        } else {
+            None
+        }
     }
 
     fn schedule_pending_requests(
@@ -183,7 +230,7 @@ impl Scheduler {
                 .model_map
                 .get(&request.model_id)
                 .ok_or(SchedulerError::UnmappedModel)?;
-            let cache_needed = request.cache_ids.len() as u32 * request_model.cache_block_size;
+            let cache_needed = (request.cache_ids.len() as u32 * self.info.cache_block_size) as u64;
 
             // Need to decide how to handle eviction of requests layers/kv cache blocks if a
             // higher priority new request needs space
@@ -196,14 +243,10 @@ impl Scheduler {
 
             // Check if the model is already scheduled to be computed next cycle, then reuse
             // weights
-            let can_allocate_model = match self.iter_req_models.get(&request_model.id) {
-                Some(_) => true,
-                None => (request_model.layer_size as u64 * 2) < self.info.layer_free_mem,
-            };
-            let can_allocate_cache = (cache_needed as u64) < self.info.cache_free_mem;
-            if can_allocate_cache && can_allocate_model {
+            let can_allocate_cache = cache_needed < self.allocator.cache_mem_remaining();
+            if can_allocate_cache {
                 new_requests.push(metadata);
-            } else if can_allocate_model {
+            } else {
                 // Check evicting other KV caches
                 // Idea:
                 // We need to check if we can free up to the cache memory required by this new
@@ -220,32 +263,16 @@ impl Scheduler {
                 //  - Note we maintain the invariant that keys are never modified, since the
                 //  priority of a currently active request is static (don't change the age of a
                 //  request until it is pre-empted or ends (in which case it's done))
-                let lowest_priority = self
-                    .request_priority_queue
-                    .pop_min()
-                    .ok_or(SchedulerError::FailedRequestID)?; // TODO: This shouldn't be an
-                // error
+                //
+                let evictable_cache = self.find_evictable_cache(&metadata, cache_needed);
 
-                let mut possible_size = 0;
-                for size in self.active_size_map.iter() {
-                    if *size.0 < lowest_priority.1 {
-                        possible_size += *size.1;
-                    } else {
-                        break;
-                    }
-                }
-
-                if possible_size > 100 { // 100 is placeholder, calc needed cache size similar to below
-                    // evict and alloc for new request
+                if let Some(evict_metadata) = evictable_cache {
+                    // evict all the metadata, copying kv cache back to cpu safely
                 } else {
-                    // mark as unfulfilled and try again later
+                    metadata.age += 1;
+                    metadata.check_priority_boost();
+                    unfulfilled_requests.push(metadata);
                 }
-            } else if can_allocate_cache {
-                // Check freeing other model
-            } else {
-                metadata.age += 1;
-                metadata.check_priority_boost();
-                unfulfilled_requests.push(metadata);
             }
         }
 
@@ -269,13 +296,7 @@ impl Scheduler {
                 .req_to_model
                 .get(&new_data.id)
                 .ok_or(SchedulerError::FailedRequestID)?;
-            let cache_mem = request.cache_ids.len() as u32
-                * self
-                    .registry
-                    .model_map
-                    .get(req_model)
-                    .ok_or(SchedulerError::UnmappedModel)?
-                    .cache_block_size;
+            let cache_mem = request.cache_ids.len() as u32 * self.info.cache_block_size;
             self.active_size_map
                 .entry(new_data)
                 .and_modify(|size| *size += cache_mem as u64)

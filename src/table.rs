@@ -1,7 +1,15 @@
-use std::collections::{HashMap, VecDeque};
+use std::{
+    collections::{HashMap, VecDeque},
+    hash::Hash,
+};
 use thiserror::Error;
 
-use crate::allocator::{Allocator, CacheBlockHandle, LayerBlockHandle, PhysicalId};
+use crate::{
+    allocator::{
+        Allocator, AllocatorError, CacheBlockHandle, LayerBlockHandle, ModelMemory, PhysicalId,
+    },
+    scheduler::{ModelID, ModelMetadata},
+};
 
 trait Evictable {
     fn is_pinned(&self) -> bool;
@@ -43,37 +51,13 @@ impl Swappable for CacheBlock {
     }
 }
 
-// The layer size combined will allow the virtual ID mapping to offset to the correct slot
+// the layer size combined will allow the virtual ID mapping to offset to the correct slot
 #[derive(Default)]
 pub struct LayerBlock {
     pub phys_id: Option<PhysicalId>,
-    // layer_size: u32,
     num_layers: u16,
     cur_layer: u16,
     pinned: bool,
-    used: bool,
-    in_clock: bool,
-}
-
-impl Evictable for LayerBlock {
-    fn is_pinned(&self) -> bool {
-        self.pinned
-    }
-    fn is_used(&self) -> bool {
-        self.used
-    }
-    fn set_used(&mut self, used: bool) {
-        self.used = used;
-    }
-    fn set_in_clock(&mut self, clock: bool) {
-        self.in_clock = clock;
-    }
-}
-
-impl Swappable for LayerBlock {
-    fn get_phys_id(&self) -> Option<PhysicalId> {
-        self.phys_id
-    }
 }
 
 fn swap_block<K, V>(
@@ -152,13 +136,15 @@ where
     }
 }
 
-#[derive(Default)]
-pub struct Table {
-    pub cache_table: HashMap<CacheBlockHandle, CacheBlock>,
-    pub layer_table: HashMap<LayerBlockHandle, LayerBlock>,
-    cache_clock_lru: VecDeque<CacheBlockHandle>, // true if used since last swept by clock
-    layer_clock_lru: VecDeque<LayerBlockHandle>,
-    // Note that either LRU being empty is a logic error (if asked to swap by the scheduler)
+struct MemoryAddr(u64);
+
+// enum that represents how a layer activation should continue
+// NeedStream -> scheduler must initiate a stream into the physical id, kernel has map from id to
+// address in uniform buffer
+// Present -> the layer is already present and no i/o is needed
+pub enum LayerActivationStatus {
+    NeedStream { target_phys: PhysicalId },
+    Present,
 }
 
 #[derive(Debug, Error)]
@@ -173,88 +159,97 @@ pub enum TableError {
     InvalidCacheHandle,
     #[error("Invalid swap: page not in memory or memory is full")]
     InvalidSwap,
+    #[error("Invalid model id during creation")]
+    InvalidModelID,
+    #[error("Allocator failure: {0}")]
+    TableError(#[from] AllocatorError),
+}
+
+#[derive(Default)]
+pub struct Table {
+    layer_phys_addr: HashMap<PhysicalId, MemoryAddr>,
+    cache_phys_addr: HashMap<PhysicalId, MemoryAddr>,
+
+    // pub layer_table: HashMap<LayerBlockHandle, LayerBlock>,
+    pub cache_table: HashMap<CacheBlockHandle, CacheBlock>,
+
+    // Note that the LRU queue being empty is a logic error (if asked to swap by the scheduler)
+    cache_clock_lru: VecDeque<CacheBlockHandle>, // true if used since last swept by clock
+                                                 // layer_clock_lru: VecDeque<LayerBlockHandle>,
 }
 
 impl Table {
-    // do we need a constructor?
-    // most of the fields should be defaultable
-    //    pub fn new() -> Self {
-    //        Table {}
-    //    }
+    pub fn new(
+        model_metadata: &HashMap<ModelID, ModelMetadata>,
+        model_phys_id: &HashMap<ModelID, ModelMemory>,
+        cache_phys_id: &[PhysicalId],
+        cache_block_size: u32,
+    ) -> Result<Self, TableError> {
+        let mut layer_phys_addr = HashMap::with_capacity(model_phys_id.len() * 2); // 2 layers
+        // streaming
+        let mut cache_phys_addr = HashMap::with_capacity(cache_phys_id.len());
 
-    // Registers a models layer block in the map
-    pub fn register_layer_block(&mut self, layer_handle: LayerBlockHandle) {
-        let layer_block = LayerBlock {
-            phys_id: None,
-            // layer_size,
-            num_layers: 0,
-            cur_layer: 0,
+        // set up mappings from physical ids to gpu memory addresses (buffer offsets)
+        // these can be added as a uniform buffer to shaders that require them - the bindings
+        // are static and will not change
+        let mut cur_mem_addr = 0;
+        for (model_id, layer_ids) in model_phys_id {
+            let metadata = model_metadata
+                .get(model_id)
+                .ok_or(TableError::InvalidModelID)?;
+            let scratchpad_size = metadata.vocab_size * metadata.info_size as u64;
+            let output_size = metadata.hidden_size
+                * metadata.mlp_expansion_factor as u64
+                * metadata.info_size as u64
+                * metadata.max_sequence_len;
+
+            // assign the streaming layer addresses
+            layer_phys_addr.insert(layer_ids.streaming_ids.0, MemoryAddr(cur_mem_addr));
+            cur_mem_addr += metadata.layer_size;
+            layer_phys_addr.insert(layer_ids.streaming_ids.1, MemoryAddr(cur_mem_addr));
+            cur_mem_addr += metadata.layer_size;
+
+            // assign the scratchpad and output addresses
+            layer_phys_addr.insert(layer_ids.scratchpad_id, MemoryAddr(cur_mem_addr));
+            cur_mem_addr += scratchpad_size;
+            layer_phys_addr.insert(layer_ids.output_id, MemoryAddr(cur_mem_addr));
+            cur_mem_addr += output_size;
+        }
+
+        for phys_id in cache_phys_id {
+            cache_phys_addr.insert(*phys_id, MemoryAddr(cur_mem_addr));
+            cur_mem_addr += cache_block_size as u64;
+        }
+
+        Ok(Table {
+            layer_phys_addr,
+            cache_phys_addr,
             ..Default::default()
-        };
-        self.layer_table.insert(layer_handle, layer_block);
+        })
     }
 
     pub fn register_cache_block(&mut self, cache_handle: CacheBlockHandle) {
-        let cache_block = CacheBlock {
-            phys_id: None,
-            pinned: false,
-            ..Default::default()
-        };
+        let cache_block = CacheBlock::default();
         self.cache_table.insert(cache_handle, cache_block);
     }
 
-    // Activates an existing layer block for a model
-    pub fn activate_layer_block(
+    // activates an existing layer block for a model
+    // takes in the model id from which to fetch the next physical id for
+    // layer handels are not needed since streaming takes a double buffering approach and only
+    // loads one layer at a time
+    pub fn activate_next_layer(
         &mut self,
         allocator: &mut Allocator,
-        layer_handle: LayerBlockHandle,
-    ) -> Result<(), TableError> {
-        // Check if the layer needs to be swapped to VRAM
-        let needs_alloc = self
-            .layer_table
-            .get(&layer_handle)
-            .map(|l| l.phys_id.is_some())
-            .ok_or(TableError::InvalidLayerHandle)?;
+        model_id: &ModelID,
+    ) -> Result<LayerActivationStatus, TableError> {
+        let target_phys = allocator.fetch_layer_phys(model_id)?;
 
-        // Take memory/swap for memory in VRAM if needed
-        let mut new_phys_id = None;
-        if needs_alloc {
-            new_phys_id = Some(match allocator.try_layer_alloc_phys() {
-                Some(id) => id,
-                None => {
-                    // TODO: Think about if we should use LRU cache for weights as well
-                    let swap_handle =
-                        clock_sweep(&mut self.layer_table, &mut self.layer_clock_lru)?;
-                    swap_block(
-                        &mut self.layer_table,
-                        allocator,
-                        &layer_handle,
-                        &swap_handle,
-                    )?
-                }
-            })
-        }
-
-        // Grab and activate layer block
-        let layer_block = self
-            .layer_table
-            .get_mut(&layer_handle)
-            .ok_or(TableError::InvalidLayerHandle)?;
-
-        if let Some(phys_id) = new_phys_id {
-            layer_block.phys_id = Some(phys_id);
-        }
-        layer_block.pinned = true;
-        layer_block.used = true;
-
-        if !layer_block.in_clock {
-            self.layer_clock_lru.push_front(layer_handle);
-            layer_block.in_clock = true;
-        }
-
-        Ok(())
+        Ok(LayerActivationStatus::NeedStream { target_phys })
     }
 
+    // activates the cache block
+    // since no data needs to be transferred, this just updates the data sent over uniform
+    // buffers to kernels
     pub fn activate_cache_block(
         &mut self,
         allocator: &mut Allocator,
