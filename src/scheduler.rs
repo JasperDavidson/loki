@@ -165,8 +165,8 @@ impl Scheduler {
 
     fn evict_finished_requests(&mut self) -> Result<(), SchedulerError> {
         // Check if any requests have finished, if so evict them
-        // TODO: I think it would it would be better if we set a flag when receiving a request from the
-        // GPU that triggered us to perform the iteration to avoid useless checking
+        // TODO: refactor this such that we receive from an async channel from a Streamer that sends us requests that have completed -> this is the Streamer that will read output tokens
+        // from the models anyway
         if self.request_complete {
             let mut complete_requests = Vec::new();
             for request in self.active_requests.iter() {
@@ -181,7 +181,9 @@ impl Scheduler {
     }
 
     // given request ids, cleanly swap them out from gpu memory
-    fn evict_requests(&mut self, request_ids: Vec<RequestID>) -> Result<(), SchedulerError> {}
+    fn evict_requests(&mut self, request_ids: Vec<RequestID>) -> Result<(), SchedulerError> {
+        todo!()
+    }
 
     // Goal: search for evictable cache blocks of lower priority than the requested
     // task, otherwise shelve and attempt again on the next step
@@ -279,28 +281,27 @@ impl Scheduler {
         Ok((new_requests, unfulfilled_requests))
     }
 
+    // allocates all resources needed in the next step
+    // includes new requests and those that require more resources going forward
     fn allocate_resources(
         &mut self,
-        new_requests: Vec<RequestMetadata>,
+        updated_requests: Vec<RequestMetadata>,
     ) -> Result<(), SchedulerError> {
-        for new_data in new_requests {
+        for metadata in updated_requests {
             let request = self
                 .registry
                 .priority_request_map
-                .get(&new_data.id)
+                .get(&metadata.id)
                 .ok_or(SchedulerError::FailedRequestID)?;
 
-            // Need to add more errors for this sequence and/or it can likely be cleaned up?
+            // figure out what else needs to be done in this allocation process
             let req_model = self
                 .registry
                 .req_to_model
-                .get(&new_data.id)
+                .get(&metadata.id)
                 .ok_or(SchedulerError::FailedRequestID)?;
             let cache_mem = request.cache_ids.len() as u32 * self.info.cache_block_size;
-            self.active_size_map
-                .entry(new_data)
-                .and_modify(|size| *size += cache_mem as u64)
-                .or_insert(cache_mem as u64);
+            self.active_size_map.insert(metadata, cache_mem as u64);
         }
 
         Ok(())

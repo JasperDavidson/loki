@@ -144,12 +144,6 @@ impl Allocator {
         CacheBlockHandle(self.virtual_counter)
     }
 
-    pub fn alloc_layer_block(&mut self) -> LayerBlockHandle {
-        self.virtual_counter += 1;
-
-        LayerBlockHandle(self.virtual_counter)
-    }
-
     // Need to handle when there aren't physical blocks available
     // Scheduler can call this when running
     pub fn try_cache_alloc_phys(&mut self) -> Option<PhysicalId> {
