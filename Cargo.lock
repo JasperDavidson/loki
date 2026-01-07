@@ -402,6 +402,7 @@ name = "loki"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "bytemuck",
  "pollster",
  "priority-queue",
  "thiserror",

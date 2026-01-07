@@ -2,6 +2,8 @@ use std::collections::HashMap;
 use thiserror::Error;
 use wgpu::{BindGroupEntry, BufferUses, PipelineLayoutDescriptor};
 
+use crate::{allocator::PhysicalId, table::MemoryAddr};
+
 struct GpuComputeContext {
     device: wgpu::Device,
     queue: wgpu::Queue,
@@ -10,6 +12,20 @@ struct GpuComputeContext {
 struct KernelContext {
     pipeline: wgpu::ComputePipeline,
     bind_group_layout: wgpu::BindGroupLayout,
+}
+
+#[repr(C)]
+#[derive(Copy, Clone, bytemuck::Pod, bytemuck::Zeroable)]
+pub struct ModifyBackendUniformBuffer {
+    read_id: u32,
+    read_offset: u32,
+    write_id: u32,
+    write_offset: u32,
+    dim: [u32; 4],
+}
+
+pub enum UniformBuffer {
+    ModifyBackend(ModifyBackendUniformBuffer),
 }
 
 #[derive(PartialEq, Eq, Hash)]
@@ -21,9 +37,18 @@ pub enum KernelType {
 pub enum BackendError {
     #[error("Kernel type not suppported")]
     KernelDNE,
+    #[error("Physical ID not mapped to a memory address")]
+    PhysicalDNE,
+    #[error("Memory currently not associated with any data")]
+    PageDNE,
+}
+
+pub struct JobDescription {
+    buffer_offsets: Vec<u64>,
 }
 
 pub struct BackendHandler {
+    uniform_buffers: wgpu::Buffer,
     slab_buffer: wgpu::Buffer,
     compute_context: GpuComputeContext,
     kernel_contexts: HashMap<KernelType, KernelContext>,
@@ -37,120 +62,36 @@ impl BackendHandler {
         let (device, queue) = adapter.request_device(&Default::default()).await.unwrap();
 
         let matrix_add_kernel =
-            device.create_shader_module(wgpu::include_wgsl!("kernels/matrix_add.wgsl"));
+            device.create_shader_module(wgpu::include_wgsl!("kernels/matrix_accumulate.wgsl"));
 
-        // Create the generic bind layouts for reuse across similar kernel layouts
-        let binary_operation_bind_layout =
-            device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
-                // .into() converts &'static str to Cow<'static, str>
-                label: Some("Binary operation layout").map(Into::into),
-                entries: &[
-                    wgpu::BindGroupLayoutEntry {
-                        binding: 0,
-                        visibility: wgpu::ShaderStages::COMPUTE,
-                        ty: wgpu::BindingType::Buffer {
-                            ty: wgpu::BufferBindingType::Uniform,
-                            has_dynamic_offset: false,
-                            min_binding_size: None,
-                        },
-                        count: None,
+        // Create the layout for every kernel
+        // - Slot 1 contains the uniform buffer, which contains the page table and other metadata such as how this kernel should access the slab buffer
+        // - Slot 2 contains the slab buffer itself
+        let kernel_layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+            label: Some("Generic kernel layout").map(Into::into),
+            entries: &[
+                wgpu::BindGroupLayoutEntry {
+                    binding: 0,
+                    visibility: wgpu::ShaderStages::COMPUTE,
+                    ty: wgpu::BindingType::Buffer {
+                        ty: wgpu::BufferBindingType::Uniform,
+                        has_dynamic_offset: false,
+                        min_binding_size: None,
                     },
-                    wgpu::BindGroupLayoutEntry {
-                        binding: 1,
-                        visibility: wgpu::ShaderStages::COMPUTE,
-                        ty: wgpu::BindingType::Buffer {
-                            ty: wgpu::BufferBindingType::Storage { read_only: true },
-                            has_dynamic_offset: false,
-                            min_binding_size: None,
-                        },
-                        count: None,
+                    count: None,
+                },
+                wgpu::BindGroupLayoutEntry {
+                    binding: 1,
+                    visibility: wgpu::ShaderStages::COMPUTE,
+                    ty: wgpu::BindingType::Buffer {
+                        ty: wgpu::BufferBindingType::Storage { read_only: false },
+                        has_dynamic_offset: false,
+                        min_binding_size: None,
                     },
-                    wgpu::BindGroupLayoutEntry {
-                        binding: 2,
-                        visibility: wgpu::ShaderStages::COMPUTE,
-                        ty: wgpu::BindingType::Buffer {
-                            ty: wgpu::BufferBindingType::Storage { read_only: true },
-                            has_dynamic_offset: false,
-                            min_binding_size: None,
-                        },
-                        count: None,
-                    },
-                    wgpu::BindGroupLayoutEntry {
-                        binding: 3,
-                        visibility: wgpu::ShaderStages::COMPUTE,
-                        ty: wgpu::BindingType::Buffer {
-                            ty: wgpu::BufferBindingType::Storage { read_only: false },
-                            has_dynamic_offset: false,
-                            min_binding_size: None,
-                        },
-                        count: None,
-                    },
-                ],
-            });
-
-        let unary_inplace_operation_bind_layout =
-            device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
-                label: Some("unary inplace op layout").map(Into::into),
-                entries: &[
-                    wgpu::BindGroupLayoutEntry {
-                        binding: 0,
-                        visibility: wgpu::ShaderStages::COMPUTE,
-                        ty: wgpu::BindingType::Buffer {
-                            ty: wgpu::BufferBindingType::Uniform,
-                            has_dynamic_offset: false,
-                            min_binding_size: None,
-                        },
-                        count: None,
-                    },
-                    wgpu::BindGroupLayoutEntry {
-                        binding: 1,
-                        visibility: wgpu::ShaderStages::COMPUTE,
-                        ty: wgpu::BindingType::Buffer {
-                            ty: wgpu::BufferBindingType::Storage { read_only: false },
-                            has_dynamic_offset: false,
-                            min_binding_size: None,
-                        },
-                        count: None,
-                    },
-                ],
-            });
-
-        let unary_move_operation_bind_layout =
-            device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
-                label: Some("unary move op layout").map(Into::into),
-                entries: &[
-                    wgpu::BindGroupLayoutEntry {
-                        binding: 0,
-                        visibility: wgpu::ShaderStages::COMPUTE,
-                        ty: wgpu::BindingType::Buffer {
-                            ty: wgpu::BufferBindingType::Uniform,
-                            has_dynamic_offset: false,
-                            min_binding_size: None,
-                        },
-                        count: None,
-                    },
-                    wgpu::BindGroupLayoutEntry {
-                        binding: 1,
-                        visibility: wgpu::ShaderStages::COMPUTE,
-                        ty: wgpu::BindingType::Buffer {
-                            ty: wgpu::BufferBindingType::Storage { read_only: true },
-                            has_dynamic_offset: false,
-                            min_binding_size: None,
-                        },
-                        count: None,
-                    },
-                    wgpu::BindGroupLayoutEntry {
-                        binding: 2,
-                        visibility: wgpu::ShaderStages::COMPUTE,
-                        ty: wgpu::BindingType::Buffer {
-                            ty: wgpu::BufferBindingType::Storage { read_only: false },
-                            has_dynamic_offset: false,
-                            min_binding_size: None,
-                        },
-                        count: None,
-                    },
-                ],
-            });
+                    count: None,
+                },
+            ],
+        });
 
         // Create the pipelines for each kernel
         let matrix_add_pipeline =
@@ -158,7 +99,7 @@ impl BackendHandler {
                 label: Some("Matrix addition"),
                 layout: Some(&device.create_pipeline_layout(&PipelineLayoutDescriptor {
                     label: Some("Matrix addition pipeline layout").map(Into::into),
-                    bind_group_layouts: &[&unary_move_operation_bind_layout],
+                    bind_group_layouts: &[&kernel_layout],
                     immediate_size: 0,
                 })),
                 module: &matrix_add_kernel,
@@ -169,7 +110,7 @@ impl BackendHandler {
 
         let matrix_add_compute_context = KernelContext {
             pipeline: matrix_add_pipeline,
-            bind_group_layout: unary_move_operation_bind_layout,
+            bind_group_layout: kernel_layout,
         };
 
         let slab_buffer = device.create_buffer(&wgpu::BufferDescriptor {
@@ -180,26 +121,69 @@ impl BackendHandler {
                 | wgpu::BufferUsages::STORAGE,
             mapped_at_creation: false,
         });
+        let uniform_buffers = device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("Uniform Buffer Container").map(Into::into),
+            size: 64000, // TODO: Come up with a good way to determine this number
+            usage: wgpu::BufferUsages::COPY_DST // TODO: Check if these are the correct access
+            // modifiers we want
+                | wgpu::BufferUsages::COPY_SRC
+                | wgpu::BufferUsages::STORAGE,
+            mapped_at_creation: false,
+        });
+
         let compute_context = GpuComputeContext { device, queue };
         let kernel_contexts =
             HashMap::from([(KernelType::MatrixAddition, matrix_add_compute_context)]);
 
         BackendHandler {
+            uniform_buffers,
             slab_buffer,
             compute_context,
             kernel_contexts,
         }
     }
 
-    // Note that when passing buffers here, ensure that the buffers match the bind group layout
-    // associated with the desired kernel
-    // The uniform buffer should always be bound to index 0
+    // Writes data into the specified offset in the slab buffer
+    fn write_slab_mem(
+        &self,
+        data: &[u8],
+        phys_id: &PhysicalId,
+        page_table: &Vec<Option<MemoryAddr>>,
+    ) -> Result<(), BackendError> {
+        let offset = page_table
+            .get(phys_id.0 as usize)
+            .ok_or(BackendError::PhysicalDNE)?
+            .ok_or(BackendError::PageDNE)?;
+        // Consider looking into write_buffer_width which uses a staging buffer... more
+        // efficient?
+        self.compute_context
+            .queue
+            .write_buffer(&self.slab_buffer, offset.0, data);
+        // See if this can be potentially optimized in the future - e.g. not writing after
+        // *every* write but maybe batching with others
+        self.compute_context.queue.submit([]);
+
+        Ok(())
+    }
+
+    // Writes data into the specified offset in the uniform buffer
+    fn write_uniform_mem(&self, uniform_buffer_data: UniformBuffer, offset: u64) {
+        match uniform_buffer_data {
+            UniformBuffer::ModifyBackend(uniform_data) => {
+                // TODO: How will the scheduler know the offset?
+                self.compute_context.queue.write_buffer(
+                    &self.uniform_buffers,
+                    offset,
+                    bytemuck::cast_slice(&[uniform_data]),
+                );
+            }
+        }
+    }
+
     fn create_bind_group(
         &self,
-        label: &str,
+        uniform_buffer_data: UniformBuffer,
         kernel_type: &KernelType,
-        uniform_buf: &wgpu::Buffer,
-        buffers: &[wgpu::Buffer],
     ) -> Result<wgpu::BindGroup, BackendError> {
         // Fetch this first to exit early if invalid kernel
         let layout = &self
@@ -208,18 +192,23 @@ impl BackendHandler {
             .ok_or(BackendError::KernelDNE)?
             .bind_group_layout;
 
+        // TOOD: Figure out how to construct the bind group layout based on offsets
         let mut bind_group_entries = Vec::with_capacity(buffers.len() + 1);
         bind_group_entries.push(wgpu::BindGroupEntry {
             binding: 0,
             resource: uniform_buf.as_entire_binding(),
         });
 
-        for (i, buffer) in buffers.iter().enumerate() {
-            bind_group_entries.push(BindGroupEntry {
-                binding: (i + 1) as u32,
-                resource: buffer.as_entire_binding(),
-            });
-        }
+        let bind_group_entries = [
+            wgpu::BindGroupEntry {
+                binding: 0,
+                resource: uniform_buf.as_entire_binding(),
+            },
+            wgpu::BindGroupEntry {
+                binding: 1,
+                resource: self.slab_buffer,
+            },
+        ];
 
         Ok(self
             .compute_context

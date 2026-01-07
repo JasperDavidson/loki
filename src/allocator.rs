@@ -63,27 +63,39 @@ pub struct Allocator {
 }
 
 impl Allocator {
-    // the size of each cache block should ideally divide the physical memory amount given to cache
+    // The size of each cache block should ideally divide the physical memory amount given to cache
+    // Memory layout:
+    // - Beginning of memory is where the page table mapping physical ids -> memory addresses is
+    // plaeced
+    //      - The page table is implemented as a linear array such that table[phys_id] = addr
+    // - Next, each model acquires enough space for two layers worth of parameters + scratchpad
+    // memory (between layers) and output space
+    // - Finally, KV Cache blocks take up the remaining memory - as many of the specified size
+    // that can be allocated
     pub fn new(
         total_mem: u64,
         cache_block_size: u32,
         model_metadata: &HashMap<ModelID, ModelMetadata>,
-    ) -> Result<Self, AllocatorError> {
+    ) -> Result<(Self, u64), AllocatorError> {
+        let mut num_ids = 0;
         let total_streaming_size: u64 = model_metadata
             .iter()
             .map(|(_, metadata)| {
-                metadata.info_size as u64 * metadata.vocab_size
-                    + metadata.max_sequence_len
+                num_ids += 4; // four physical ids per model
+                metadata.info_size as u64 * metadata.vocab_size // output size
+                    + metadata.max_sequence_len // scratchpad size
                         * metadata.hidden_size
                         * metadata.mlp_expansion_factor as u64
                         * metadata.info_size as u64
-                    + metadata.layer_size * 2
+                    + metadata.layer_size * 2 // streaming layer size
             })
             .sum::<u64>();
         if total_streaming_size > total_mem {
             return Err(AllocatorError::OutOfMemory);
         }
         let cache_mem_size = total_mem - total_streaming_size;
+        num_ids += cache_mem_size / cache_block_size as u64; // number of ids tells us how many
+        // bytes the page table needs to be
 
         // allocate all the layers to physical ids
         let mut phys_id = 0;
@@ -124,15 +136,18 @@ impl Allocator {
             phys_id += 1;
         }
 
-        Ok(Self {
-            total_mem,
-            layer_free,
-            model_to_phys,
-            cache_free,
-            cache_block_size,
-            layer_mem_total: total_streaming_size,
-            virtual_counter: 0,
-        })
+        Ok((
+            Self {
+                total_mem,
+                layer_free,
+                model_to_phys,
+                cache_free,
+                cache_block_size,
+                layer_mem_total: total_streaming_size,
+                virtual_counter: 0,
+            },
+            num_ids,
+        ))
     }
 
     // hands out virtual IDs to models that request it

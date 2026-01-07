@@ -136,7 +136,8 @@ where
     }
 }
 
-struct MemoryAddr(u64);
+#[derive(Clone, Copy)]
+pub struct MemoryAddr(pub u64);
 
 // enum that represents how a layer activation should continue
 // NeedStream -> scheduler must initiate a stream into the physical id, kernel has map from id to
@@ -167,8 +168,11 @@ pub enum TableError {
 
 #[derive(Default)]
 pub struct Table {
-    layer_phys_addr: HashMap<PhysicalId, MemoryAddr>,
-    cache_phys_addr: HashMap<PhysicalId, MemoryAddr>,
+    // Represented as a contiguous layer of memory to allow for efficient access
+    // - Note that upon physical ID assignment by the Allocator, they are assigned sequentially,
+    // so this alternative mapping will preserve the invariant of phys id -> memory
+    // - Further it contains options so that KV cache blocks can be invalidated
+    phys_to_mem: Vec<Option<MemoryAddr>>,
 
     // pub layer_table: HashMap<LayerBlockHandle, LayerBlock>,
     pub cache_table: HashMap<CacheBlockHandle, CacheBlock>,
@@ -185,9 +189,10 @@ impl Table {
         cache_phys_id: &[PhysicalId],
         cache_block_size: u32,
     ) -> Result<Self, TableError> {
-        let mut layer_phys_addr = HashMap::with_capacity(model_phys_id.len() * 2); // 2 layers
-        // streaming
-        let mut cache_phys_addr = HashMap::with_capacity(cache_phys_id.len());
+        // Pre-initialize to allow for indexing below since HashMap iterator access is
+        // non-deterministic
+        let mut phys_to_mem: Vec<Option<MemoryAddr>> =
+            vec![None; model_phys_id.len() * 2 + cache_phys_id.len()];
 
         // set up mappings from physical ids to gpu memory addresses (buffer offsets)
         // these can be added as a uniform buffer to shaders that require them - the bindings
@@ -204,26 +209,25 @@ impl Table {
                 * metadata.max_sequence_len;
 
             // assign the streaming layer addresses
-            layer_phys_addr.insert(layer_ids.streaming_ids.0, MemoryAddr(cur_mem_addr));
+            phys_to_mem[layer_ids.streaming_ids.0.0 as usize] = Some(MemoryAddr(cur_mem_addr));
             cur_mem_addr += metadata.layer_size;
-            layer_phys_addr.insert(layer_ids.streaming_ids.1, MemoryAddr(cur_mem_addr));
+            phys_to_mem[layer_ids.streaming_ids.1.0 as usize] = Some(MemoryAddr(cur_mem_addr));
             cur_mem_addr += metadata.layer_size;
 
             // assign the scratchpad and output addresses
-            layer_phys_addr.insert(layer_ids.scratchpad_id, MemoryAddr(cur_mem_addr));
+            phys_to_mem[layer_ids.scratchpad_id.0 as usize] = Some(MemoryAddr(cur_mem_addr));
             cur_mem_addr += scratchpad_size;
-            layer_phys_addr.insert(layer_ids.output_id, MemoryAddr(cur_mem_addr));
+            phys_to_mem[layer_ids.output_id.0 as usize] = Some(MemoryAddr(cur_mem_addr));
             cur_mem_addr += output_size;
         }
 
-        for phys_id in cache_phys_id {
-            cache_phys_addr.insert(*phys_id, MemoryAddr(cur_mem_addr));
+        for cache_id in cache_phys_id {
+            phys_to_mem[cache_id.0 as usize] = Some(MemoryAddr(cur_mem_addr));
             cur_mem_addr += cache_block_size as u64;
         }
 
         Ok(Table {
-            layer_phys_addr,
-            cache_phys_addr,
+            phys_to_mem,
             ..Default::default()
         })
     }
