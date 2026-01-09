@@ -5,6 +5,7 @@ struct Uniforms {
   right_read_offset: u32,
   write_id: u32,
   write_offset: u32,
+  _padding: vec2<u32>,
   dim: vec4<u32>
 };
 
