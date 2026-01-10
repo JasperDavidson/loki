@@ -18,6 +18,12 @@ struct KernelContext {
     bind_group_layout: wgpu::BindGroupLayout,
 }
 
+trait UniformBuffer: bytemuck::Pod + bytemuck::Zeroable {
+    fn as_bytes(&self) -> &[u8] {
+        bytemuck::bytes_of(self)
+    }
+}
+
 #[repr(C)]
 #[derive(Copy, Clone, bytemuck::Pod, bytemuck::Zeroable)]
 pub struct ModifyBackendUniformBuffer {
@@ -28,52 +34,50 @@ pub struct ModifyBackendUniformBuffer {
     dim: [u32; 4],
 }
 
+impl UniformBuffer for ModifyBackendUniformBuffer {}
+
 #[repr(C)]
 #[derive(Copy, Clone, bytemuck::Pod, bytemuck::Zeroable)]
 pub struct BinaryOpUniformBuffer {
-    left_read_id: u32,
     left_read_offset: u32,
-    right_read_id: u32,
     right_read_offset: u32,
-    write_id: u32,
     write_offset: u32,
     // TOOD: Surely there's some way around this padding?
-    _padding: [u32; 2],
+    _padding: u32,
     dim: [u32; 4],
 }
 
+impl UniformBuffer for BinaryOpUniformBuffer {}
+
 impl BinaryOpUniformBuffer {
     pub fn new(
-        left_read_id: u32,
         left_read_offset: u32,
-        right_read_id: u32,
         right_read_offset: u32,
-        write_id: u32,
         write_offset: u32,
         dim: [u32; 4],
     ) -> Self {
         Self {
-            left_read_id,
             left_read_offset,
-            right_read_id,
             right_read_offset,
-            write_id,
             write_offset,
-            _padding: [0, 0],
+            _padding: 0,
             dim,
         }
     }
-}
-
-pub enum UniformBuffer {
-    ModifyBackend(ModifyBackendUniformBuffer),
-    BinaryOp(BinaryOpUniformBuffer),
 }
 
 #[derive(PartialEq, Eq, Hash)]
 pub enum KernelType {
     MatrixAccumulate,
     MatrixAddition,
+}
+
+pub struct DispatchDescription<T: UniformBuffer> {
+    kernel_type: KernelType,
+    workgroup_dim: (u64, u64, u64),
+    // TODO: How to store uniform buffers + offset?
+    uniform_data: (T, u64),
+    cache_addresses: Option<Vec<MemoryAddr>>,
 }
 
 #[derive(Debug, Error)]
@@ -90,10 +94,6 @@ pub enum BackendError {
     BufferAsnycError(#[from] wgpu::BufferAsyncError),
     #[error("Failed to poll from ")]
     PollError(#[from] wgpu::PollError),
-}
-
-pub struct JobDescription {
-    buffer_offsets: Vec<u64>,
 }
 
 pub struct BackendHandler {
@@ -250,6 +250,8 @@ impl BackendHandler {
         Ok(())
     }
 
+    // TODO: Do we need this anymore/in what capacity?
+    // I think not since we're going with a "pass local table" approach now
     pub fn write_page_table(&self, page_table: &[Option<MemoryAddr>]) {
         let mut gpu_page_table = vec![0.0f32; page_table.len()];
         for (i, addr) in page_table.iter().enumerate() {
@@ -266,27 +268,16 @@ impl BackendHandler {
     }
 
     // Writes data into the specified offset in the uniform buffer
-    pub fn write_uniform_mem(&self, uniform_buffer_data: UniformBuffer, offset: u64) {
+    pub fn write_uniform_mem<T: UniformBuffer>(&self, uniform_buffer_data: T, offset: u64) {
         // DEFINITELY a better way to structure this -> literally maps to the same outcome
         // each time
-        match uniform_buffer_data {
-            UniformBuffer::ModifyBackend(uniform_data) => {
-                // TODO: How will the scheduler know the offset?
-                self.compute_context.queue.write_buffer(
-                    &self.uniform_buffers,
-                    offset,
-                    bytemuck::cast_slice(&[uniform_data]),
-                );
-            }
-            UniformBuffer::BinaryOp(uniform_data) => {
-                // TODO: How will the scheduler know the offset?
-                self.compute_context.queue.write_buffer(
-                    &self.uniform_buffers,
-                    offset,
-                    bytemuck::cast_slice(&[uniform_data]),
-                );
-            }
-        }
+        self.compute_context.queue.write_buffer(
+            &self.uniform_buffers,
+            offset,
+            uniform_buffer_data.as_bytes(),
+        );
+
+        self.compute_context.queue.submit([]);
     }
 
     // TODO: Make it so that this wgpu code is isolated
@@ -359,8 +350,6 @@ impl BackendHandler {
                 .get(&kernel_contexts[i])
                 .ok_or(BackendError::KernelDNE)?;
             compute_pass.set_pipeline(&context.pipeline);
-            // TODO: What should actually happen here is the offset should be specified into one
-            // slab buffer - or already accounted for by the kernels?
             compute_pass.set_bind_group(0, &bind_groups[i], &[]);
             compute_pass.dispatch_workgroups(
                 workgroup_dims[i].0,

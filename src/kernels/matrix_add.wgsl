@@ -1,11 +1,8 @@
 struct Uniforms {
-  left_read_id: u32,
   left_read_offset: u32,
-  right_read_id: u32,
   right_read_offset: u32,
-  write_id: u32,
   write_offset: u32,
-  _padding: vec2<u32>,
+  _padding: u32,
   dim: vec4<u32>
 };
 
@@ -24,14 +21,10 @@ fn main(@builtin(global_invocation_id) global_id: vec3<u32>) {
     return;
   }
 
-  let left_op_addr = u32(slab_buffer[uniforms.left_read_id]);
-  let right_op_addr = u32(slab_buffer[uniforms.right_read_id]);
-  let scratchpad_addr = u32(slab_buffer[uniforms.write_id]);
-
   let thread_idx = global_id.y * uniforms.dim.x + global_id.x;
-  let left_idx = left_op_addr + uniforms.left_read_offset + thread_idx;
-  let right_idx = right_op_addr + uniforms.right_read_offset + thread_idx;
-  let scratchpad_idx = scratchpad_addr + uniforms.write_offset + thread_idx;
+  let left_idx = uniforms.left_read_offset + thread_idx;
+  let right_idx = uniforms.right_read_offset + thread_idx;
+  let scratchpad_idx = uniforms.write_offset + thread_idx;
 
   slab_buffer[scratchpad_idx] = slab_buffer[left_idx] + slab_buffer[right_idx];
 }

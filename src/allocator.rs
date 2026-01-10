@@ -76,12 +76,10 @@ impl Allocator {
         total_mem: u64,
         cache_block_size: u32,
         model_metadata: &HashMap<ModelID, ModelMetadata>,
-    ) -> Result<(Self, u64), AllocatorError> {
-        let mut num_ids = 0;
+    ) -> Result<Self, AllocatorError> {
         let total_streaming_size: u64 = model_metadata
             .iter()
             .map(|(_, metadata)| {
-                num_ids += 4; // four physical ids per model
                 metadata.info_size as u64 * metadata.vocab_size // output size
                     + metadata.max_sequence_len // scratchpad size
                         * metadata.hidden_size
@@ -93,9 +91,6 @@ impl Allocator {
         if total_streaming_size > total_mem {
             return Err(AllocatorError::OutOfMemory);
         }
-        let cache_mem_size = total_mem - total_streaming_size;
-        num_ids += cache_mem_size / cache_block_size as u64; // number of ids tells us how many
-        // bytes the page table needs to be
 
         // allocate all the layers to physical ids
         let mut phys_id = 0;
@@ -128,6 +123,7 @@ impl Allocator {
         }
 
         // construct the cache free list from the remaining memory
+        let cache_mem_size = total_mem - total_streaming_size;
         let num_cache_blocks = cache_mem_size / (cache_block_size as u64);
         let mut cache_free = Vec::with_capacity(num_cache_blocks as usize);
 
@@ -136,18 +132,15 @@ impl Allocator {
             phys_id += 1;
         }
 
-        Ok((
-            Self {
-                total_mem,
-                layer_free,
-                model_to_phys,
-                cache_free,
-                cache_block_size,
-                layer_mem_total: total_streaming_size,
-                virtual_counter: 0,
-            },
-            num_ids,
-        ))
+        Ok(Self {
+            total_mem,
+            layer_free,
+            model_to_phys,
+            cache_free,
+            cache_block_size,
+            layer_mem_total: total_streaming_size,
+            virtual_counter: 0,
+        })
     }
 
     // hands out virtual IDs to models that request it

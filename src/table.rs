@@ -139,6 +139,17 @@ where
 #[derive(Clone, Copy)]
 pub struct MemoryAddr(pub u64);
 
+impl MemoryAddr {
+    pub fn to_gpu_index(&self) -> u32 {
+        assert!(
+            self.0 % 4 == 0,
+            "Address {} is not aligned to f32 stride!",
+            self.0
+        );
+        (self.0 / 4) as u32
+    }
+}
+
 // enum that represents how a layer activation should continue
 // NeedStream -> scheduler must initiate a stream into the physical id, kernel has map from id to
 // address in uniform buffer
@@ -171,7 +182,7 @@ pub struct Table {
     // Represented as a contiguous layer of memory to allow for efficient access
     // - Note that upon physical ID assignment by the Allocator, they are assigned sequentially,
     // so this alternative mapping will preserve the invariant of phys id -> memory
-    // - Further it contains options so that KV cache blocks can be invalidated
+    // - Further it contains Options so that KV cache blocks can be invalidated
     phys_to_mem: Vec<Option<MemoryAddr>>,
 
     // pub layer_table: HashMap<LayerBlockHandle, LayerBlock>,
@@ -194,9 +205,9 @@ impl Table {
         let mut phys_to_mem: Vec<Option<MemoryAddr>> =
             vec![None; model_phys_id.len() * 2 + cache_phys_id.len()];
 
-        // set up mappings from physical ids to gpu memory addresses (buffer offsets)
-        // these can be added as a uniform buffer to shaders that require them - the bindings
-        // are static and will not change
+        // Set up mappings from physical ids to gpu memory addresses (buffer offsets)
+        // When kernels require certain physical ids their addresses will be fetched from here
+        // before being sent off
         let mut cur_mem_addr = 0;
         for (model_id, layer_ids) in model_phys_id {
             let metadata = model_metadata
@@ -208,13 +219,13 @@ impl Table {
                 * metadata.info_size as u64
                 * metadata.max_sequence_len;
 
-            // assign the streaming layer addresses
+            // Assign the streaming layer addresses
             phys_to_mem[layer_ids.streaming_ids.0.0 as usize] = Some(MemoryAddr(cur_mem_addr));
             cur_mem_addr += metadata.layer_size;
             phys_to_mem[layer_ids.streaming_ids.1.0 as usize] = Some(MemoryAddr(cur_mem_addr));
             cur_mem_addr += metadata.layer_size;
 
-            // assign the scratchpad and output addresses
+            // Assign the scratchpad and output addresses
             phys_to_mem[layer_ids.scratchpad_id.0 as usize] = Some(MemoryAddr(cur_mem_addr));
             cur_mem_addr += scratchpad_size;
             phys_to_mem[layer_ids.output_id.0 as usize] = Some(MemoryAddr(cur_mem_addr));
@@ -237,9 +248,10 @@ impl Table {
         self.cache_table.insert(cache_handle, cache_block);
     }
 
-    // activates an existing layer block for a model
-    // takes in the model id from which to fetch the next physical id for
-    // layer handels are not needed since streaming takes a double buffering approach and only
+    // Activates an existing layer block for a model
+    // Takes in the model id from which to fetch the next physical id for
+    // LOGIC: This function should only be called when the next layer needs to be streamed in
+    // Layer handles are not needed since streaming takes a double buffering approach and only
     // loads one layer at a time
     pub fn activate_next_layer(
         &mut self,
@@ -248,6 +260,7 @@ impl Table {
     ) -> Result<LayerActivationStatus, TableError> {
         let target_phys = allocator.fetch_layer_phys(model_id)?;
 
+        // Look into if there's any times we would *not* need to stream
         Ok(LayerActivationStatus::NeedStream { target_phys })
     }
 
