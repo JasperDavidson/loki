@@ -38,9 +38,8 @@ struct RequestMetadata {
 
 impl Ord for RequestMetadata {
     fn cmp(&self, other: &Self) -> std::cmp::Ordering {
-        other
-            .tier
-            .cmp(&self.tier)
+        self.tier
+            .cmp(&other.tier)
             .then_with(|| self.age.cmp(&other.age))
     }
 }
@@ -122,10 +121,7 @@ impl Scheduler {
     //    }
 
     // TODO: Figure out external API to receive requests
-    pub fn enqueue_request(
-        &mut self,
-        incoming_request: IncomingRequest,
-    ) -> Result<(), SchedulerError> {
+    pub fn enqueue_request(&mut self, incoming_request: IncomingRequest) {
         let req_id = RequestID(self.request_counter);
         self.request_priority_queue.push(
             req_id,
@@ -136,8 +132,6 @@ impl Scheduler {
             },
         );
         self.request_counter += 1;
-
-        Ok(())
     }
 
     // This function gets ran after every decoding cycle (every model has produced one token)
@@ -167,6 +161,7 @@ impl Scheduler {
         // Check if any requests have finished, if so evict them
         // TODO: refactor this such that we receive from an async channel from a Streamer that sends us requests that have completed -> this is the Streamer that will read output tokens
         // from the models anyway
+        todo!();
         if self.request_complete {
             let mut complete_requests = Vec::new();
             for request in self.active_requests.iter() {
@@ -196,20 +191,20 @@ impl Scheduler {
     ) -> Option<Vec<RequestMetadata>> {
         let mut possible_size = 0;
         let mut possible_metadata = Vec::new();
-        for size in self.active_size_map.iter().rev() {
-            if *size.0 > *metadata || possible_size >= cache_needed {
+        for (req, size) in self.active_size_map.iter() {
+            if *req > *metadata {
                 break;
-            } else {
-                possible_size += *size.1;
-                possible_metadata.push(*size.0);
+            }
+
+            possible_size += size;
+            possible_metadata.push(*req);
+
+            if possible_size >= cache_needed {
+                return Some(possible_metadata);
             }
         }
 
-        if possible_size >= cache_needed {
-            Some(possible_metadata)
-        } else {
-            None
-        }
+        None
     }
 
     fn schedule_pending_requests(
@@ -308,6 +303,9 @@ impl Scheduler {
     }
 
     fn step_active_requests(&mut self) -> Result<(), SchedulerError> {
+        // Every time a uniform buffer is generated for a scheduled request, increment this offset
+        // accordingly
+        let uniform_buffer_offset = 0;
         for request in self.active_requests.iter() {}
 
         Ok(())

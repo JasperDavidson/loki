@@ -18,7 +18,7 @@ struct KernelContext {
     bind_group_layout: wgpu::BindGroupLayout,
 }
 
-trait UniformBuffer: bytemuck::Pod + bytemuck::Zeroable {
+pub trait UniformBuffer: bytemuck::Pod + bytemuck::Zeroable {
     fn as_bytes(&self) -> &[u8] {
         bytemuck::bytes_of(self)
     }
@@ -66,18 +66,42 @@ impl BinaryOpUniformBuffer {
     }
 }
 
-#[derive(PartialEq, Eq, Hash)]
+#[derive(Clone, Copy, PartialEq, Eq, Hash)]
 pub enum KernelType {
     MatrixAccumulate,
     MatrixAddition,
 }
 
+// Exists so that the Scheduler can interact with the backend without interfacing with WGPU
 pub struct DispatchDescription<T: UniformBuffer> {
+    label: String,
     kernel_type: KernelType,
-    workgroup_dim: (u64, u64, u64),
+    workgroup_dim: (u32, u32, u32),
     // TODO: How to store uniform buffers + offset?
-    uniform_data: (T, u64),
-    cache_addresses: Option<Vec<MemoryAddr>>,
+    uniform_data: T,
+    uniform_offset: u64,
+    cache_addresses: Option<Vec<MemoryAddr>>, // Optional cache addresses if kernel requires
+                                              // (e.g. attention)
+}
+
+impl<T: UniformBuffer> DispatchDescription<T> {
+    pub fn new(
+        label: &str,
+        kernel_type: KernelType,
+        workgroup_dim: (u32, u32, u32),
+        uniform_data: T,
+        uniform_offset: u64,
+        cache_addresses: Option<Vec<MemoryAddr>>,
+    ) -> Self {
+        Self {
+            label: label.to_string(),
+            kernel_type,
+            workgroup_dim,
+            uniform_data,
+            uniform_offset,
+            cache_addresses,
+        }
+    }
 }
 
 #[derive(Debug, Error)]
@@ -186,7 +210,7 @@ impl BackendHandler {
 
         let slab_buffer = device.create_buffer(&wgpu::BufferDescriptor {
             label: Some("Slab buffer").map(Into::into),
-            size: mem_size,
+            size: (mem_size as f32 * 0.9) as u64,
             usage: wgpu::BufferUsages::COPY_DST
                 | wgpu::BufferUsages::COPY_SRC
                 | wgpu::BufferUsages::STORAGE,
@@ -194,7 +218,7 @@ impl BackendHandler {
         });
         let uniform_buffers = device.create_buffer(&wgpu::BufferDescriptor {
             label: Some("Uniform Buffer Container").map(Into::into),
-            size: 64000, // TODO: Come up with a good way to determine this number
+            size: (mem_size as f32 * 0.05) as u64, // TODO: Come up with a good way to determine this number
             usage: wgpu::BufferUsages::COPY_DST // TODO: Check if these are the correct access
             // modifiers we want
                 | wgpu::BufferUsages::STORAGE
@@ -203,7 +227,7 @@ impl BackendHandler {
         });
         let staging_buffer = device.create_buffer(&wgpu::BufferDescriptor {
             label: Some("Staging Buffer").map(Into::into),
-            size: 500000, // TODO: Come up with a good way to determine this number, should be
+            size: (mem_size as f32 * 0.05) as u64, // TODO: Come up with a good way to determine this number, should be
             // as large as the output portion of the slab buffer might be
             usage: wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::MAP_READ,
             mapped_at_creation: false,
@@ -225,6 +249,40 @@ impl BackendHandler {
             compute_context,
             kernel_contexts,
         }
+    }
+
+    // Maybe optimize by moving the values?
+    pub fn process_descriptions<T: UniformBuffer>(
+        &self,
+        dispatch_descriptions: &[DispatchDescription<T>],
+    ) -> Result<(), BackendError> {
+        let kernel_types = dispatch_descriptions
+            .iter()
+            .map(|desc| desc.kernel_type)
+            .collect();
+        let workgroup_dims = dispatch_descriptions
+            .iter()
+            .map(|desc| desc.workgroup_dim)
+            .collect();
+        let mut bind_groups = Vec::with_capacity(dispatch_descriptions.len());
+
+        for desc in dispatch_descriptions {
+            self.write_uniform_mem(desc.uniform_data, desc.uniform_offset);
+            bind_groups.push(self.create_bind_group(
+                &desc.label,
+                desc.uniform_offset,
+                desc.uniform_data.as_bytes().len(),
+                &desc.kernel_type,
+            )?);
+        }
+        let encoder = self
+            .compute_context
+            .device
+            .create_command_encoder(&Default::default());
+
+        self.commit_actions(encoder, kernel_types, bind_groups, workgroup_dims)?;
+
+        Ok(())
     }
 
     // Writes data into the specified offset in the slab buffer
@@ -250,37 +308,18 @@ impl BackendHandler {
         Ok(())
     }
 
-    // TODO: Do we need this anymore/in what capacity?
-    // I think not since we're going with a "pass local table" approach now
-    pub fn write_page_table(&self, page_table: &[Option<MemoryAddr>]) {
-        let mut gpu_page_table = vec![0.0f32; page_table.len()];
-        for (i, addr) in page_table.iter().enumerate() {
-            if let Some(page_addr) = addr {
-                gpu_page_table[i] = (page_addr.0 as f32) / 4.0;
-            }
-        }
-
-        self.compute_context.queue.write_buffer(
-            &self.slab_buffer,
-            0,
-            &bytemuck::cast_slice(&gpu_page_table),
-        );
-    }
-
     // Writes data into the specified offset in the uniform buffer
     pub fn write_uniform_mem<T: UniformBuffer>(&self, uniform_buffer_data: T, offset: u64) {
-        // DEFINITELY a better way to structure this -> literally maps to the same outcome
-        // each time
+        // Note: Submitted on next command buffer submission to queue
+        // Hardware should automatically handle streaming for us between the transfer and
+        // compute queue
         self.compute_context.queue.write_buffer(
             &self.uniform_buffers,
             offset,
             uniform_buffer_data.as_bytes(),
         );
-
-        self.compute_context.queue.submit([]);
     }
 
-    // TODO: Make it so that this wgpu code is isolated
     pub fn create_bind_group(
         &self,
         label: &str,
@@ -320,59 +359,59 @@ impl BackendHandler {
             }))
     }
 
-    // TODO: Abstract away inner wgpu workings
-    pub fn create_step_encoder(&self) -> wgpu::CommandEncoder {
-        self.compute_context
-            .device
-            .create_command_encoder(&Default::default())
-    }
-
     pub fn commit_actions(
         &self,
-        encoder: &mut wgpu::CommandEncoder,
-        kernel_contexts: Vec<KernelType>,
+        mut encoder: wgpu::CommandEncoder,
+        kernel_types: Vec<KernelType>,
         // Sent as separate vectors to indicate they could perhaps be decoupled in the future
         bind_groups: Vec<wgpu::BindGroup>,
         workgroup_dims: Vec<(u32, u32, u32)>,
     ) -> Result<(), BackendError> {
-        assert_eq!(kernel_contexts.len(), bind_groups.len());
+        // Change these asserts in the future
+        assert_eq!(kernel_types.len(), bind_groups.len());
         assert_eq!(bind_groups.len(), workgroup_dims.len());
-        assert_eq!(workgroup_dims.len(), kernel_contexts.len());
+        assert_eq!(workgroup_dims.len(), kernel_types.len());
 
-        // probably allow for pass names in future
-        let mut compute_pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
-            ..Default::default()
-        });
+        {
+            let mut compute_pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
+                ..Default::default()
+            });
 
-        for i in 0..kernel_contexts.len() {
-            let context = self
-                .kernel_contexts
-                .get(&kernel_contexts[i])
-                .ok_or(BackendError::KernelDNE)?;
-            compute_pass.set_pipeline(&context.pipeline);
-            compute_pass.set_bind_group(0, &bind_groups[i], &[]);
-            compute_pass.dispatch_workgroups(
-                workgroup_dims[i].0,
-                workgroup_dims[i].1,
-                workgroup_dims[i].2,
-            );
+            for i in 0..kernel_types.len() {
+                let context = self
+                    .kernel_contexts
+                    .get(&kernel_types[i])
+                    .ok_or(BackendError::KernelDNE)?;
+                compute_pass.set_pipeline(&context.pipeline);
+                compute_pass.set_bind_group(0, &bind_groups[i], &[]);
+                compute_pass.dispatch_workgroups(
+                    workgroup_dims[i].0,
+                    workgroup_dims[i].1,
+                    workgroup_dims[i].2,
+                );
+            }
         }
+
+        self.compute_context.queue.submit(Some(encoder.finish()));
 
         Ok(())
     }
 
     pub fn fetch_result(
         &self,
-        mut encoder: wgpu::CommandEncoder,
         output_id: &PhysicalId,
         output_size: u64,
         page_table: &[Option<MemoryAddr>],
-    ) -> Result<&[u8], BackendError> {
+    ) -> Result<Vec<f32>, BackendError> {
         let out_addr = page_table
             .get(output_id.0 as usize)
             .ok_or(BackendError::PhysicalDNE)?
             .ok_or(BackendError::PageDNE)?;
 
+        let mut encoder = self
+            .compute_context
+            .device
+            .create_command_encoder(&Default::default());
         encoder.copy_buffer_to_buffer(
             &self.slab_buffer,
             out_addr.0,
@@ -382,6 +421,7 @@ impl BackendHandler {
         );
 
         self.compute_context.queue.submit(Some(encoder.finish()));
+        let recv_data: Vec<f32>;
 
         {
             let (tx, rx) = std::sync::mpsc::channel();
@@ -399,10 +439,10 @@ impl BackendHandler {
             rx.recv()??;
 
             let output_data = self.staging_buffer.get_mapped_range(0..output_size);
-            let num_data: &[f32] = bytemuck::cast_slice(&output_data);
-            println!("GPU Result: {:?}", num_data);
+            recv_data = bytemuck::cast_slice(&output_data).to_vec();
         }
 
-        Ok(&[5])
+        println!("{:?}", recv_data);
+        Ok(recv_data)
     }
 }

@@ -69,7 +69,7 @@ mod tests {
 
     #[test]
     fn test_matadd() -> anyhow::Result<()> {
-        let backend = BackendHandler::new(80).block_on();
+        let backend = BackendHandler::new(20000).block_on();
         let data_one: Vec<f32> = vec![1.0, 2.0, 3.0];
         let data_one_id = PhysicalId(0);
         let data_two: Vec<f32> = vec![1.0, 2.0, 3.0];
@@ -94,23 +94,20 @@ mod tests {
             page_table[output_id.0 as usize].unwrap().to_gpu_index(),
             [3, 1, 1, 1],
         );
-        backend.write_uniform_mem(matadd_uniform, 0);
+        // backend.write_uniform_mem(matadd_uniform, 0);
 
-        let bind_group = backend.create_bind_group(
-            "Matadd bind group",
+        let dispatch_description = DispatchDescription::new(
+            "Matrix addition",
+            KernelType::MatrixAddition,
+            (1, 1, 1),
+            matadd_uniform,
             0,
-            std::mem::size_of::<BinaryOpUniformBuffer>(),
-            &KernelType::MatrixAddition,
-        )?;
-        let mut encoder = backend.create_step_encoder();
+            None,
+        );
+        let dispatch_descriptions = vec![dispatch_description];
+        backend.process_descriptions(&dispatch_descriptions)?;
 
-        backend.commit_actions(
-            &mut encoder,
-            vec![KernelType::MatrixAddition],
-            vec![bind_group],
-            vec![(1, 1, 1)],
-        )?;
-        backend.fetch_result(encoder, &output_id, data_byte_size, &page_table)?;
+        backend.fetch_result(&output_id, data_byte_size, &page_table)?;
 
         Ok(())
     }
